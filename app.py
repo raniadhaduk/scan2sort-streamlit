@@ -2,7 +2,6 @@ import os
 import json
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
-from collections import defaultdict
 
 import streamlit as st
 from PIL import Image
@@ -25,152 +24,10 @@ genai.configure(api_key=GOOGLE_API_KEY)
 MODEL_NAME = "gemini-2.5-flash-lite"
 model = genai.GenerativeModel(MODEL_NAME)
 
-# ============================================
-# 1. Sessions & Memory (per-user, with persistence)
-# ============================================
-
-class SessionStore:
-    """
-    Simple in-memory session + memory store with disk persistence.
-    - Per-user streak
-    - Total scans
-    - Total points
-    - Mistakes by item
-    """
-
-    def __init__(self, path: str = "session_store.json"):
-        self.path = path
-        self.sessions: Dict[str, Dict[str, Any]] = defaultdict(
-            lambda: {
-                "total_scans": 0,
-                "streak": 0,
-                "total_points": 0,
-                "mistakes": defaultdict(int),
-            }
-        )
-        self.load()
-
-    def get_user_state(self, user_id: str) -> Dict[str, Any]:
-        return self.sessions[user_id]
-
-    def update_after_scan(
-        self,
-        user_id: str,
-        points: int,
-        all_confident: bool,
-        mistaken_items: List[str],
-    ):
-        state = self.sessions[user_id]
-        state["total_scans"] += 1
-        state["total_points"] += points
-
-        if all_confident:
-            state["streak"] += 1
-        else:
-            state["streak"] = 0
-
-        for item in mistaken_items:
-            state["mistakes"][item] += 1
-
-        # persist after each update
-        self.save()
-        return state
-
-    # ---------- Persistence helpers ----------
-
-    def _to_serializable(self) -> Dict[str, Any]:
-        """Convert defaultdicts to normal dicts for JSON."""
-        data = {}
-        for user_id, state in self.sessions.items():
-            data[user_id] = {
-                "total_scans": state.get("total_scans", 0),
-                "streak": state.get("streak", 0),
-                "total_points": state.get("total_points", 0),
-                "mistakes": dict(state.get("mistakes", {})),  # defaultdict -> dict
-            }
-        return data
-
-    def save(self):
-        try:
-            data = self._to_serializable()
-            with open(self.path, "w") as f:
-                json.dump(data, f)
-        except Exception as e:
-            print("[WARN] Failed to save SessionStore:", e)
-
-    def load(self):
-        try:
-            if not os.path.exists(self.path):
-                return
-            with open(self.path, "r") as f:
-                data = json.load(f)
-
-            for user_id, state in data.items():
-                self.sessions[user_id] = {
-                    "total_scans": state.get("total_scans", 0),
-                    "streak": state.get("streak", 0),
-                    "total_points": state.get("total_points", 0),
-                    "mistakes": defaultdict(int, state.get("mistakes", {})),
-                }
-        except Exception as e:
-            print("[WARN] Failed to load SessionStore:", e)
-
-
-SESSION_STORE = SessionStore()
-
 
 # ============================================
-# 2. Observability: Logging & TWO-LEVEL Metrics
+# 1. Simple logging helper (observability)
 # ============================================
-
-class Metrics:
-    """
-    Two-level metrics:
-    - session_counters: reset when app restarts
-    - global_counters: persisted in metrics_store.json
-    """
-
-    def __init__(self, path: str = "metrics_store.json"):
-        self.path = path
-        self.session_counters = defaultdict(int)
-        self.global_counters = defaultdict(int)
-        self.load()
-
-    def inc(self, name: str, amount: int = 1):
-        # update both session + global
-        self.session_counters[name] += amount
-        self.global_counters[name] += amount
-        self.save()
-
-    def snapshot_session(self) -> Dict[str, int]:
-        return dict(self.session_counters)
-
-    def snapshot_global(self) -> Dict[str, int]:
-        return dict(self.global_counters)
-
-    # ---------- Persistence helpers ----------
-
-    def save(self):
-        try:
-            data = dict(self.global_counters)
-            with open(self.path, "w") as f:
-                json.dump(data, f)
-        except Exception as e:
-            print("[WARN] Failed to save Metrics:", e)
-
-    def load(self):
-        try:
-            if not os.path.exists(self.path):
-                return
-            with open(self.path, "r") as f:
-                data = json.load(f)
-            self.global_counters = defaultdict(int, data)
-        except Exception as e:
-            print("[WARN] Failed to load Metrics:", e)
-
-
-METRICS = Metrics()
-
 
 def log_event(event: str, **kwargs):
     # Developer logs (shows in server logs, not UI)
@@ -178,7 +35,7 @@ def log_event(event: str, **kwargs):
 
 
 # ============================================
-# 3. Data Structures (Agents I/O)
+# 2. Data Structures (Agents I/O)
 # ============================================
 
 @dataclass
@@ -197,17 +54,8 @@ class PolicyDecision:
     source: str  # "material_rules" | "local_db" | "backup_ai"
 
 
-@dataclass
-class CoachResponse:
-    message: str
-    total_points: int
-    new_streak: int
-    badge_unlocked: Optional[str] = None
-    user_state: Optional[Dict[str, Any]] = None
-
-
 # ============================================
-# 4. Waste Rules DB (Ottawa)
+# 3. Waste Rules DB (Ottawa)
 # ============================================
 
 RAW_RULE_CATEGORIES = [
@@ -392,7 +240,7 @@ for bin_type, notes, items in RAW_RULE_CATEGORIES:
 
 
 # ============================================
-# 5. Two MCP-style Tools
+# 4. Tools (MCP-style)
 # ============================================
 
 class LocalWasteRulesTool:
@@ -405,7 +253,6 @@ class LocalWasteRulesTool:
         self.rules_db = rules_db
 
     def classify(self, description: str) -> Optional[Dict[str, Any]]:
-        METRICS.inc("local_tool_calls")
         text = description.lower()
         best_match = None
         best_score = 0
@@ -430,7 +277,6 @@ class BackupWasteAIAssistantTool:
     """
 
     def classify(self, description: str) -> Dict[str, Any]:
-        METRICS.inc("backup_tool_calls")
         prompt = f"""
         You are a waste-sorting assistant for the City of Ottawa, Canada.
 
@@ -459,7 +305,7 @@ BACKUP_AI_TOOL = BackupWasteAIAssistantTool()
 
 
 # ============================================
-# 6. Extra Material Rules (multi-part items)
+# 5. Extra Material Rules (for multi-part items)
 # ============================================
 
 MATERIAL_RULES: Dict[str, Dict[str, str]] = {
@@ -503,7 +349,7 @@ MATERIAL_RULES: Dict[str, Dict[str, str]] = {
 
 
 # ============================================
-# 7. Multi-material handling helpers
+# 6. Multi-material handling helpers
 # ============================================
 
 def split_multimaterial_item(description: str) -> List[str]:
@@ -567,8 +413,6 @@ def classify_single_component(component_desc: str) -> PolicyDecision:
 
     # 3️⃣ Backup MCP tool
     backup_res = BACKUP_AI_TOOL.classify(component_desc)
-    if "Unknown" in backup_res["bin"]:
-        METRICS.inc("unknown_bin")
 
     return PolicyDecision(
         item=component_desc,
@@ -585,7 +429,7 @@ def classify_item(description: str) -> List[PolicyDecision]:
 
 
 # ============================================
-# 8. Vision Agent (describe waste item from image)
+# 7. Vision Agent (describe waste item from image)
 # ============================================
 
 VISION_SYSTEM_PROMPT = (
@@ -599,8 +443,6 @@ def vision_agent_pil(img: Image.Image) -> VisionResult:
     """
     Agent 1: Vision Agent (using PIL image directly)
     """
-    METRICS.inc("images_scanned")
-
     resp = model.generate_content(
         [
             VISION_SYSTEM_PROMPT,
@@ -614,7 +456,7 @@ def vision_agent_pil(img: Image.Image) -> VisionResult:
 
 
 # ============================================
-# 9. Extra triage: waste vs not-waste vs blurry
+# 8. Triage: waste vs not-waste vs blurry
 # ============================================
 
 VISION_CLASSIFIER_PROMPT = """
@@ -639,9 +481,9 @@ def triage_image(img: Image.Image) -> Dict[str, Any]:
       - not_waste (e.g., person, animal, scenery)
       - blurry
 
-    More robust:
+    Robust:
       - Handles JSON inside ``` code fences
-      - If JSON parse fails, use keyword heuristics instead of always 'blurry'
+      - If JSON parse fails, use keyword heuristics
     """
     resp = model.generate_content(
         [
@@ -696,7 +538,7 @@ def triage_image(img: Image.Image) -> Dict[str, Any]:
 
 
 # ============================================
-# 10. Policy Agent
+# 9. Policy Agent
 # ============================================
 
 def policy_agent(vision: VisionResult) -> List[PolicyDecision]:
@@ -714,76 +556,7 @@ def policy_agent(vision: VisionResult) -> List[PolicyDecision]:
 
 
 # ============================================
-# 11. Coach Agent (Sessions & Memory)
-# ============================================
-
-def coach_agent(
-    user_id: str,
-    decisions: List[PolicyDecision],
-) -> CoachResponse:
-    """
-    Agent 3: Coach Agent
-    - Uses SESSION_STORE as memory
-    - Awards points & updates streak
-    """
-    total_points = 0
-    mistaken_items: List[str] = []
-
-    for d in decisions:
-        if d.source in ("material_rules", "local_db"):
-            total_points += 10
-        elif d.source == "backup_ai":
-            total_points += 5
-            mistaken_items.append(d.item)
-        else:
-            total_points += 2
-            mistaken_items.append(d.item)
-
-    all_confident = all(d.source in ("material_rules", "local_db") for d in decisions)
-
-    state = SESSION_STORE.update_after_scan(
-        user_id=user_id,
-        points=total_points,
-        all_confident=all_confident,
-        mistaken_items=mistaken_items,
-    )
-
-    badge = None
-    if state["streak"] > 0 and state["streak"] % 5 == 0:
-        badge = "Recycling Hero 🏅 (5 confident scans in a row!)"
-
-    if all_confident:
-        msg = (
-            f"Awesome, {user_id}! All parts were sorted confidently. "
-            f"You earned {total_points} points. 🌱"
-        )
-    else:
-        msg = (
-            f"Nice work, {user_id}! You earned {total_points} points. "
-            "Some parts used the AI backup tool; double-check tricky items in Ottawa's official tools."
-        )
-
-    METRICS.inc("scans")
-
-    log_event(
-        "CoachAgent.summary",
-        user_id=user_id,
-        total_points=total_points,
-        new_streak=state["streak"],
-        badge=badge or "None",
-    )
-
-    return CoachResponse(
-        message=msg,
-        total_points=total_points,
-        new_streak=state["streak"],
-        badge_unlocked=badge,
-        user_state=state,
-    )
-
-
-# ============================================
-# 12. Bin Assets (for user-facing UI)
+# 10. Bin Assets (for user-facing UI)
 # ============================================
 
 BIN_ASSETS = {
@@ -831,12 +604,13 @@ BIN_ASSETS = {
 
 
 # ============================================
-# 13. Customer-facing Multi-Agent Pipeline
+# 11. Customer-facing Pipeline
+#      Vision Agent → Policy Agent
 # ============================================
 
-def run_full_pipeline(img: Image.Image, user_id: str = "guest") -> Dict[str, Any]:
+def run_full_pipeline(img: Image.Image) -> Dict[str, Any]:
     """
-    Vision Agent → Policy Agent → Coach Agent
+    Vision Agent → Policy Agent
     Returns UI-friendly dict.
     """
     # 1) Vision agent (describe)
@@ -844,9 +618,6 @@ def run_full_pipeline(img: Image.Image, user_id: str = "guest") -> Dict[str, Any
 
     # 2) Policy agent (bins)
     policy_decisions = policy_agent(vision_res)
-
-    # 3) Coach agent (points, streak, badge)
-    coach_res = coach_agent(user_id, policy_decisions)
 
     # Group decisions by bin type
     bins_view: Dict[str, Dict[str, Any]] = {}
@@ -871,16 +642,12 @@ def run_full_pipeline(img: Image.Image, user_id: str = "guest") -> Dict[str, Any
 
     return {
         "bins": list(bins_view.values()),
-        "points_this_scan": coach_res.total_points,
-        "streak": coach_res.new_streak,
-        "badge": coach_res.badge_unlocked,
         "raw_description": vision_res.description,
-        "coach_message": coach_res.message,
     }
 
 
 # ============================================
-# 14. Streamlit UI
+# 12. Streamlit UI
 # ============================================
 
 st.set_page_config(page_title="Scan2Sort – Waste Sorting Assistant", page_icon="♻️")
@@ -888,10 +655,8 @@ st.set_page_config(page_title="Scan2Sort – Waste Sorting Assistant", page_icon
 st.title("Scan2Sort – Waste Sorting Assistant")
 st.write(
     "Upload a photo of a **waste item** (cup, bottle, food scraps, packaging). "
-    "The AI agent will identify the item, choose the right bin, and award you points."
+    "The AI agent will identify the item and tell you which bin to use."
 )
-
-user_id_input = st.text_input("Optional: enter a nickname for streaks & points", value="guest")
 
 uploaded_file = st.file_uploader("Upload an image of your waste item", type=["png", "jpg", "jpeg"])
 
@@ -918,8 +683,8 @@ if uploaded_file is not None:
             st.info("Please upload a photo of a waste item like a cup, bottle, packaging, or food scraps.")
         elif category == "waste":
             # Run full agent pipeline
-            with st.spinner("Classifying and scoring..."):
-                result = run_full_pipeline(image, user_id=user_id_input)
+            with st.spinner("Classifying..."):
+                result = run_full_pipeline(image)
 
             st.success("Result")
             st.caption(f"Detected description: _{result['raw_description']}_")
@@ -961,24 +726,6 @@ if uploaded_file is not None:
                         </div>
                     </div>
                     """,
-                    unsafe_allow_html=True,
-                )
-
-            # Points, streak, badge
-            st.markdown(
-                f"<div style='text-align: right; font-weight: 600; margin-top: 12px;'>"
-                f"Points this scan: {result['points_this_scan']}</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<div style='text-align: right; font-size: 13px; color: #4b5563;'>"
-                f"Current streak for {user_id_input}: {result['streak']}</div>",
-                unsafe_allow_html=True,
-            )
-            if result["badge"]:
-                st.markdown(
-                    f"<div style='text-align: right; font-size: 13px; color: #15803d;'>"
-                    f"Badge unlocked: {result['badge']}</div>",
                     unsafe_allow_html=True,
                 )
         else:
