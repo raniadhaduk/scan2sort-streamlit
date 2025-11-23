@@ -77,6 +77,7 @@ RAW_RULE_CATEGORIES = [
             "greasy pizza box", "soiled paper plate", "compostable paper cup",
             "small plant trimmings", "wilted flowers", "dead flowers",
             "pumpkin guts", "pumpkin seeds (cooked)", "corn cob", "corn husk",
+            # you can also add "pumpkin", "whole pumpkin" to local rules if you like
         ],
     ),
 
@@ -273,28 +274,76 @@ class LocalWasteRulesTool:
 class BackupWasteAIAssistantTool:
     """
     MCP Tool #2 (backup):
-      - Asks Gemini directly for the best guess bin & explanation.
+      - Asks Gemini directly for bin + explanation in JSON.
     """
+
+    ALLOWED_BINS = [
+        "Garbage",
+        "Recycling (Blue Bin)",
+        "Green Bin (Organics)",
+        "Hazardous Waste",
+        "Special Collection / Call 3-1-1",
+        "Refund/Return",
+        "Varies by material",
+        "Unknown",
+    ]
 
     def classify(self, description: str) -> Dict[str, Any]:
         prompt = f"""
-        You are a waste-sorting assistant for the City of Ottawa, Canada.
+You are a waste-sorting assistant for the City of Ottawa, Canada.
 
-        Based on your knowledge of waste sorting rules in Ottawa, determine:
-        1. Which bin this item MOST LIKELY belongs in:
-           (Garbage, Recycling (Blue Bin), Green Bin (Organics), Hazardous Waste, Special Drop-Off)
-        2. Write a short 2–3 sentence explanation.
+Determine where this item should go and respond ONLY as compact JSON.
 
-        If you are unsure, say the bin is "Unknown" and recommend checking the
-        official City of Ottawa Waste Explorer or calling 3-1-1.
+Item: "{description}"
 
-        Item: "{description}"
-        """
+Return EXACTLY this JSON shape and nothing else:
+
+{{
+  "bin": "<one of: Garbage, Recycling (Blue Bin), Green Bin (Organics), Hazardous Waste, Special Collection / Call 3-1-1, Refund/Return, Varies by material, Unknown>",
+  "explanation": "<short 2–3 sentence explanation for a resident>"
+}}
+"""
         resp = model.generate_content(prompt)
-        explanation = resp.text.strip()
+        raw = resp.text.strip()
+        log_event("BackupTool.raw", text=raw)
+
+        # Strip code fences if present
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+
+        bin_value = "Unknown"
+        explanation = raw
+
+        # Try to parse JSON
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                b = data.get("bin", "").strip()
+                e = data.get("explanation", "").strip() or explanation
+                if b in self.ALLOWED_BINS:
+                    bin_value = b
+                    explanation = e
+        except Exception as e:
+            log_event("BackupTool.json_parse_error", error=str(e))
+
+        # Heuristic fallback if bin still Unknown: infer from explanation text
+        if bin_value == "Unknown":
+            lower = explanation.lower()
+            if "green bin" in lower or "organics" in lower or "compost" in lower:
+                bin_value = "Green Bin (Organics)"
+            elif "recycl" in lower or "blue bin" in lower:
+                bin_value = "Recycling (Blue Bin)"
+            elif "hazard" in lower or "depot" in lower:
+                bin_value = "Hazardous Waste"
+            elif "special collection" in lower or "large item" in lower:
+                bin_value = "Special Collection / Call 3-1-1"
 
         return {
-            "bin": "Unknown (AI backup)",
+            "bin": bin_value,
             "notes": explanation,
             "source": "backup_ai",
         }
@@ -411,7 +460,7 @@ def classify_single_component(component_desc: str) -> PolicyDecision:
 
     log_event("LocalTool.miss", item=component_desc)
 
-    # 3️⃣ Backup MCP tool
+    # 3️⃣ Backup MCP tool (Gemini JSON)
     backup_res = BACKUP_AI_TOOL.classify(component_desc)
 
     return PolicyDecision(
@@ -498,9 +547,7 @@ def triage_image(img: Image.Image) -> Dict[str, Any]:
     # 1) Strip code fences if Gemini wrapped JSON in ```...```
     if text.startswith("```"):
         lines = text.splitlines()
-        # drop first line (``` or ```json)
         lines = lines[1:]
-        # drop trailing ``` if present
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         text = "\n".join(lines).strip()
@@ -516,25 +563,13 @@ def triage_image(img: Image.Image) -> Dict[str, Any]:
     # 3) Fallback: heuristic classification based on plain text
     lower = text.lower()
 
-    # If Gemini explicitly mentions blur / out of focus
     if any(k in lower for k in ["blurry", "blurred", "out of focus", "too dark", "unclear"]):
-        return {
-            "category": "blurry",
-            "description": text,
-        }
+        return {"category": "blurry", "description": text}
 
-    # If it clearly talks about people/animals instead of items
     if any(k in lower for k in ["person", "people", "face", "selfie", "human", "dog", "cat", "animal"]):
-        return {
-            "category": "not_waste",
-            "description": text,
-        }
+        return {"category": "not_waste", "description": text}
 
-    # Otherwise, assume it's a waste description and treat as 'waste'
-    return {
-        "category": "waste",
-        "description": text,
-    }
+    return {"category": "waste", "description": text}
 
 
 # ============================================
@@ -595,7 +630,7 @@ BIN_ASSETS = {
         "emoji": "⚪",
         "color": "#9ca3af",
     },
-    "Unknown (AI backup)": {
+    "Unknown": {
         "name": "Unknown – check city tools",
         "emoji": "❓",
         "color": "#6b7280",
