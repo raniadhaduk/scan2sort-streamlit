@@ -638,6 +638,10 @@ def triage_image(img: Image.Image) -> Dict[str, Any]:
       - waste
       - not_waste (e.g., person, animal, scenery)
       - blurry
+
+    More robust:
+      - Handles JSON inside ``` code fences
+      - If JSON parse fails, use keyword heuristics instead of always 'blurry'
     """
     resp = model.generate_content(
         [
@@ -647,13 +651,48 @@ def triage_image(img: Image.Image) -> Dict[str, Any]:
     )
 
     text = resp.text.strip()
+    log_event("Triage.raw_response", text=text)
+
+    # 1) Strip code fences if Gemini wrapped JSON in ```...```
+    if text.startswith("```"):
+        lines = text.splitlines()
+        # drop first line (``` or ```json)
+        lines = lines[1:]
+        # drop trailing ``` if present
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    # 2) Try JSON parse
     try:
         data = json.loads(text)
-        if not isinstance(data, dict):
-            raise ValueError("Not a JSON object")
-        return data
-    except Exception:
-        return {"category": "blurry", "description": "Could not confidently parse response."}
+        if isinstance(data, dict) and "category" in data:
+            return data
+    except Exception as e:
+        log_event("Triage.json_parse_error", error=str(e))
+
+    # 3) Fallback: heuristic classification based on plain text
+    lower = text.lower()
+
+    # If Gemini explicitly mentions blur / out of focus
+    if any(k in lower for k in ["blurry", "blurred", "out of focus", "too dark", "unclear"]):
+        return {
+            "category": "blurry",
+            "description": text,
+        }
+
+    # If it clearly talks about people/animals instead of items
+    if any(k in lower for k in ["person", "people", "face", "selfie", "human", "dog", "cat", "animal"]):
+        return {
+            "category": "not_waste",
+            "description": text,
+        }
+
+    # Otherwise, assume it's a waste description and treat as 'waste'
+    return {
+        "category": "waste",
+        "description": text,
+    }
 
 
 # ============================================
